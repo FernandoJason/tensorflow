@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_GPU_EXECUTABLE_H_
 #define XLA_SERVICE_GPU_GPU_EXECUTABLE_H_
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -36,6 +37,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/gpu/runtime/annotation.h"
+#include "xla/backends/gpu/runtime/collective_memory_cache.h"
 #include "xla/backends/gpu/runtime/thunk.h"
 #include "xla/backends/gpu/runtime/thunk.pb.h"
 #include "xla/backends/gpu/runtime/thunk_executor.h"
@@ -289,6 +291,15 @@ class GpuExecutable : public Executable {
       const absl::flat_hash_map<LogicalBuffer::Color, int64_t>&
           allocate_granularity);
 
+  CollectiveMemoryCache& GetCollectiveMemoryCache(int device_ordinal) {
+    if (device_ordinal >= 0 && device_ordinal < kMaxDevices) {
+      return collective_memory_caches_per_device_[device_ordinal];
+    }
+    // The last cache is used for MIG partitions case when device ordinal is
+    // equals to -1.
+    return collective_memory_caches_per_device_[kMaxDevices];
+  }
+
   // The LLVM IR, in string format, of the unoptimized module generated for
   // this GpuExecutable. We save a string instead of an llvm::Module* because
   // leaving llvm::Module* in a singleton can cause the heap checker to emit
@@ -397,6 +408,10 @@ class GpuExecutable : public Executable {
   stream_executor::ExecutableAbiVersion executable_abi_version_;
 
   std::optional<xla::cpu::TargetMachineOptions> cpu_target_machine_options_;
+
+  constexpr static int kMaxDevices = 8;
+  std::array<CollectiveMemoryCache, kMaxDevices + 1>
+      collective_memory_caches_per_device_;
 };
 
 absl::StatusOr<absl::flat_hash_map<ShapeIndex, GpuExecutable::OutputInfo>>

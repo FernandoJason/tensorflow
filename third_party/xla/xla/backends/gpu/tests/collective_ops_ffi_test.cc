@@ -13,12 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
@@ -30,6 +32,7 @@ limitations under the License.
 #include "xla/backends/gpu/runtime/collective_clique_requests.h"
 #include "xla/backends/gpu/runtime/collective_cliques.h"
 #include "xla/backends/gpu/runtime/collective_execution.h"
+#include "xla/backends/gpu/runtime/collective_kernel_api.h"
 #include "xla/backends/gpu/runtime/collective_memory.h"
 #include "xla/backends/gpu/runtime/collective_memory_requests.h"
 #include "xla/backends/gpu/runtime/collective_params.h"
@@ -47,6 +50,7 @@ limitations under the License.
 #include "xla/service/rendezvous.h"
 #include "xla/status_macros.h"
 #include "xla/stream_executor/device_address.h"
+#include "xla/stream_executor/device_address_handle.h"
 #include "xla/stream_executor/gpu/gpu_kernel_registry.h"
 #include "xla/stream_executor/launch_dim.h"
 #include "xla/stream_executor/stream.h"
@@ -147,6 +151,7 @@ static absl::Status PrepareDeviceAllReduce(
 static absl::Status PrepareMulticastAllReduce(
     ffi::BufferR0<U32> src, ffi::Result<ffi::BufferR0<U32>> dst,
     const CollectiveParams* collective_params,
+    CollectiveCliqueRequests* clique_requests,
     CollectiveMemoryRequests* memory_requests) {
   TF_RET_CHECK(collective_params && memory_requests);
 
@@ -157,6 +162,13 @@ static absl::Status PrepareMulticastAllReduce(
           *collective_params, {AllDevices()},
           CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_FLATTENED_ID,
           AsyncStreamKind::ASYNC_STREAM_KIND_COLLECTIVE));
+
+  std::vector<GlobalDeviceId> all_device_groups;
+  for (int i = 0; i < kNumReplicas; ++i) {
+    all_device_groups.push_back(GlobalDeviceId(i));
+  }
+  TF_RETURN_IF_ERROR(clique_requests->RequestClique(
+      clique_key, /*device_groups=*/{all_device_groups}));
 
   // Request src buffer to be mapped to multimem on the given clique.
   //
@@ -314,6 +326,104 @@ static absl::Status MulticastAllReduce(
   return stream->BlockHostUntilDone();
 }
 
+// FFI handler that launches device kernel that does all-reduce using multicast
+// memory access.
+static absl::Status DelayedMulticastAllReduce(
+    se::Stream* stream, ffi::BufferR0<U32> src,
+    ffi::Result<ffi::BufferR0<U32>> dst,
+    const CollectiveParams* collective_params,
+    const CollectiveMemory* collective_memory) {
+  static absl::NoDestructor<std::array<stream_executor::DeviceAddressHandle, 2>>
+      barrier_signal_buffer_handles;
+  static absl::NoDestructor<std::array<stream_executor::DeviceAddressHandle, 2>>
+      barrier_signal_value_buffer_handles;
+
+  TF_RET_CHECK(collective_params && collective_memory);
+
+  TF_ASSIGN_OR_RETURN(
+      GpuCliqueKey clique_key,
+      GetGpuCliqueKey(
+          *collective_params, {AllDevices()},
+          CollectiveOpGroupMode::COLLECTIVE_OP_GROUP_MODE_FLATTENED_ID,
+          AsyncStreamKind::ASYNC_STREAM_KIND_COLLECTIVE));
+
+  auto [src_mmem, src_offset] =
+      collective_memory->FindMultimemAddress(clique_key, src.device_memory());
+
+  TF_RET_CHECK(src_mmem != nullptr);
+
+  // Load custom kernel that does device-initiated collectives.
+  TF_ASSIGN_OR_RETURN(
+      auto kernel,
+      se::gpu::GpuKernelRegistry::GetGlobalRegistry()
+          .LoadKernel<DelayedMultimemAllReduce>(collective_params->executor));
+
+  // Create device addresses from multimem pointer.
+  auto src_addr =
+      se::DeviceAddress<uint32_t>::MakeFromByteSize(src_mmem, src.size_bytes());
+
+  RankId current_rank =
+      clique_key.rank(collective_params->global_device_id).value();
+  if (barrier_signal_buffer_handles->at(current_rank.value())
+          .address()
+          .is_null()) {
+    barrier_signal_buffer_handles->at(current_rank.value()) =
+        se::DeviceAddressHandle{
+            collective_params->executor,
+            collective_params->executor->Allocate(
+                xla::gpu::GetMultiGpuBarrierSignalBufferSize())};
+    se::DeviceAddressBase barrier_signal_buffer_address =
+        barrier_signal_buffer_handles->at(current_rank.value()).address();
+    TF_RETURN_IF_ERROR(stream->MemZero(&barrier_signal_buffer_address,
+                                       barrier_signal_buffer_address.size()));
+  }
+
+  if (barrier_signal_value_buffer_handles->at(current_rank.value())
+          .address()
+          .is_null()) {
+    barrier_signal_value_buffer_handles->at(current_rank.value()) =
+        se::DeviceAddressHandle{
+            collective_params->executor,
+            collective_params->executor->Allocate(
+                xla::gpu::GetMultiGpuBarrierSignalValueSize())};
+    se::DeviceAddressBase barrier_signal_value_buffer_address =
+        barrier_signal_value_buffer_handles->at(current_rank.value()).address();
+    TF_RETURN_IF_ERROR(
+        stream->MemZero(&barrier_signal_value_buffer_address,
+                        barrier_signal_value_buffer_address.size()));
+  }
+
+  TF_RETURN_IF_ERROR(stream->BlockHostUntilDone());
+  // Because we launch a trivial kernel we use a device-side rendezvous to make
+  // sure that both devices will execute the kernel together after inputs become
+  // ready on both devices. Any real kernel must use device-side barriers.
+  static constexpr int32_t kKey = 0;
+  const int32_t* key = &kKey;
+  TF_RETURN_IF_ERROR(Rendezvous<const int32_t*>(
+      "DelayedMulticastAllReduce", key, 2, absl::Seconds(1), absl::Seconds(5)));
+
+  se::BlockDim block_dims(1);
+  se::ThreadDim thread_dims(8);
+
+  TF_RETURN_IF_ERROR(kernel.Launch(thread_dims, block_dims, stream, src_addr,
+                                   dst->device_memory(), src_offset,
+                                   src.element_count()));
+
+  std::vector<se::DeviceAddressBase> peer_barrier_signal_buffers;
+  peer_barrier_signal_buffers.reserve(clique_key.num_devices());
+  for (int i = 0; i < clique_key.num_devices(); ++i) {
+    peer_barrier_signal_buffers.push_back(
+        barrier_signal_buffer_handles->at(i).address());
+  }
+
+  // Run device barrier to prevent destruction of multimem handler before peer
+  // accesses are done.
+  return xla::gpu::LaunchMultiGpuBarrier(
+      stream, clique_key.num_devices(), current_rank,
+      peer_barrier_signal_buffers,
+      barrier_signal_value_buffer_handles->at(current_rank.value()).address());
+}
+
 // FFI handler that launches device kernel that does all-reduce using peer
 // memory access.
 static absl::Status PeerAllReduce(se::Stream* stream, ffi::BufferR0<U32> src,
@@ -396,9 +506,18 @@ XLA_FFI_DEFINE_HANDLER(kPrepareMulticastAllReduce, PrepareMulticastAllReduce,
                            .Arg<ffi::BufferR0<U32>>()  // src
                            .Ret<ffi::BufferR0<U32>>()  // dst
                            .Ctx<ffi::CollectiveParams>()
+                           .Ctx<ffi::CollectiveCliqueRequests>()
                            .Ctx<ffi::CollectiveMemoryRequests>());
 
 XLA_FFI_DEFINE_HANDLER(kMulticastAllReduce, MulticastAllReduce,
+                       ffi::Ffi::Bind()
+                           .Ctx<ffi::Stream>()
+                           .Arg<ffi::BufferR0<U32>>()  // src
+                           .Ret<ffi::BufferR0<U32>>()  // dst
+                           .Ctx<ffi::CollectiveParams>()
+                           .Ctx<ffi::CollectiveMemory>());
+
+XLA_FFI_DEFINE_HANDLER(kDelayedMulticastAllReduce, DelayedMulticastAllReduce,
                        ffi::Ffi::Bind()
                            .Ctx<ffi::Stream>()
                            .Arg<ffi::BufferR0<U32>>()  // src
@@ -678,6 +797,60 @@ TEST_F(CollectiveOpsTestFFI, PeerAllReduce) {
 
   // sum [0, num_devices)
   const uint32_t expected = kNumReplicas * (kNumReplicas - 1) / 2;
+  for (int i = 0; i < kNumReplicas; ++i) {
+    LiteralTestUtil::ExpectR0Equal<uint32_t>(expected, results[i]);
+  }
+}
+
+// Register handler bundle for the custom all-reduce operation with
+// device-initiated collective kernels that use multimem addresses.
+XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(),
+                         "__xla_test$$delayed_multimem_all_reduce", "gpu",
+                         XLA_FFI_Handler_Bundle{
+                             /*instantiate=*/nullptr,
+                             /*prepare=*/kPrepareMulticastAllReduce,
+                             /*initialize=*/nullptr,
+                             /*execute=*/kDelayedMulticastAllReduce,
+                         });
+
+// Test checks that multicast kernels can be executed after thunk scheduling
+// is done. This checks that collective memory cache prevents multicast handles
+// from destruction.
+TEST_F(CollectiveOpsTestFFI, MulticastDelayedExecutionAllReduce) {
+  if (device_count() < kNumReplicas) {
+    GTEST_SKIP() << "Test requires at least " << kNumReplicas << " devices ("
+                 << device_count() << " available)";
+  }
+
+  if (!IsHopperAndHigher()) {
+    GTEST_SKIP() << "Test requires Hopper+";
+  }
+
+  constexpr absl::string_view hlo_string = R"(
+      HloModule m, replica_count=2
+
+      ENTRY test_computation {
+        c0 = u32[] constant(1)
+        in = u32[]{:S(1)} copy(c0)
+        ROOT all-reduce = u32[] custom-call(in),
+          custom_call_target="__xla_test$$delayed_multimem_all_reduce",
+          api_version=API_VERSION_TYPED_FFI
+      }
+    )";
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(hlo_string, kNumReplicas));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      ExecutionResult execution_result,
+      ExecuteReplicated(std::move(module),
+                        /*arguments=*/std::vector<Literal*>(),
+                        /*run_hlo_passes=*/false));
+
+  absl::Span<const Literal> results = execution_result.results;
+  ASSERT_EQ(results.size(), kNumReplicas);
+
+  const uint32_t expected = 2;
   for (int i = 0; i < kNumReplicas; ++i) {
     LiteralTestUtil::ExpectR0Equal<uint32_t>(expected, results[i]);
   }

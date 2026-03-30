@@ -55,6 +55,15 @@ struct MultimemAllReduce {
                       size_t>;                                   // count
 };
 
+// Same kernel as above, but launched with a delayed execution.
+struct DelayedMultimemAllReduce {
+  using KernelType =
+      se::TypedKernel<stream_executor::DeviceAddress<uint32_t>,  // src_mmem
+                      stream_executor::DeviceAddress<uint32_t>,  // dst_mmem
+                      size_t,                                    // src_offset
+                      size_t>;                                   // count
+};
+
 // Trivial peer all-reduce for U32 data type without any barriers,
 // the kernel assumes that data is ready when it is launched.
 struct Peer2AllReduce {

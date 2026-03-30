@@ -1696,8 +1696,10 @@ xla_test(
     backends = ["h100"],
     deps = [
         ":collective_clique_requests",
+        ":collective_cliques",
         ":collective_kernel_thunk",
         ":collective_memory",
+        ":collective_memory_cache",
         ":collective_memory_requests",
         ":collective_params",
         ":collective_thunk",
@@ -1706,6 +1708,8 @@ xla_test(
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_data_proto_cc",
+        "//xla/backends/gpu/collectives:gpu_clique_key",
+        "//xla/backends/gpu/runtime:collective_execution",
         "//xla/core/collectives:reduction_kind",
         "//xla/runtime:device_id",
         "//xla/service:buffer_assignment",
@@ -2185,6 +2189,7 @@ cc_library(
     # copybara:uncomment compatible_with = ["//buildenv/target:non_prod"],
     deps = [
         ":collective_cliques",
+        ":collective_memory_cache",
         ":collective_memory_requests",
         ":collective_params",
         "//xla:util",
@@ -2201,6 +2206,7 @@ cc_library(
         "//xla/stream_executor/gpu:multicast_memory",
         "//xla/tsl/platform:status_macros",
         "//xla/tsl/util:safe_reinterpret_cast",
+        "//xla/tsl/util:tied_ref",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/container:flat_hash_map",
@@ -2235,6 +2241,16 @@ cc_library(
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "collective_memory_cache",
+    hdrs = ["collective_memory_cache.h"],
+    compatible_with = get_compatible_with_portable(),
+    deps = [
+        "//xla/stream_executor/gpu:multicast_memory",
+        "//xla/tsl/util:tied_ref",
     ],
 )
 

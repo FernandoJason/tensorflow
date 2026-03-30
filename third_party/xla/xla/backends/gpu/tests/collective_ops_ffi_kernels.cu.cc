@@ -73,12 +73,8 @@ static __global__ void NcclDevAllReduce(void* dev_comm, ncclWindow_t src_win,
 }
 #endif
 
-// A trivial all-reduce for S32 data type that uses multimem instructions.
-//
-// WARNING: This kernel doesn't have any barriers and it is a caller
-// responsibility to make sure that data is ready on all ranks.
-static __global__ void MulticastAllReduce(uint32_t* src_mmem, uint32_t* dst,
-                                          size_t src_offset, size_t count) {
+static __device__ void MulticastAllReduceImpl(uint32_t* src_mmem, uint32_t* dst,
+                                              size_t src_offset, size_t count) {
 #if __CUDA_ARCH__ >= 900
   int64_t offset = blockIdx.x * blockDim.x + threadIdx.x;
   int64_t stride = blockDim.x * gridDim.x;
@@ -94,6 +90,26 @@ static __global__ void MulticastAllReduce(uint32_t* src_mmem, uint32_t* dst,
 #endif  // __CUDA_ARCH__ >= 900
 }
 
+// A trivial all-reduce for S32 data type that uses multimem instructions.
+//
+// WARNING: This kernel doesn't have any barriers and it is a caller
+// responsibility to make sure that data is ready on all ranks.
+static __global__ void MulticastAllReduce(uint32_t* src_mmem, uint32_t* dst,
+                                          size_t src_offset, size_t count) {
+  MulticastAllReduceImpl(src_mmem, dst, src_offset, count);
+}
+
+// Same as above, but with a delayed execution.
+static __global__ void DelayedMulticastAllReduce(uint32_t* src_mmem,
+                                                 uint32_t* dst,
+                                                 size_t src_offset,
+                                                 size_t count) {
+#if __CUDA_ARCH__ >= 700
+  // Sleep for 2 seconds to simulate a delay.
+  __nanosleep(2 * 1000 * 1000 * 1000);
+#endif
+  MulticastAllReduceImpl(src_mmem, dst, src_offset, count);
+}
 // A trivial all-reduce for S32 data type that uses peer access.
 //
 // WARNING: This kernel doesn't have any barriers and it is a caller
@@ -121,6 +137,12 @@ static se::KernelLoaderSpec MulticastAllReduceKernelSpec(int32_t arity) {
       arity);
 }
 
+static se::KernelLoaderSpec DelayedMulticastAllReduceKernelSpec(int32_t arity) {
+  return se::KernelLoaderSpec::CreateInProcessSymbolSpec(
+      absl::bit_cast<void*>(&DelayedMulticastAllReduce),
+      "DelayedMulticastAllReduce_S32", arity);
+}
+
 static se::KernelLoaderSpec Peer2AllReduceKernelSpec(int32_t arity) {
   return se::KernelLoaderSpec::CreateInProcessSymbolSpec(
       absl::bit_cast<void*>(&PeerAllReduce), "Peer2AllReduce_S32", arity);
@@ -137,6 +159,11 @@ GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(
     CollectiveMulticastAllReduce, xla::gpu::MultimemAllReduce,
     stream_executor::cuda::kCudaPlatformId,
     xla::gpu::MulticastAllReduceKernelSpec);
+
+GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(
+    CollectiveDelayedMulticastAllReduce, xla::gpu::DelayedMultimemAllReduce,
+    stream_executor::cuda::kCudaPlatformId,
+    xla::gpu::DelayedMulticastAllReduceKernelSpec);
 
 GPU_KERNEL_REGISTRY_REGISTER_KERNEL_STATICALLY(
     CollectivePeer2AllReduce, xla::gpu::Peer2AllReduce,
